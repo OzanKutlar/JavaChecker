@@ -77,6 +77,7 @@
             cursor: pointer;
             transition: background-color 0.2s;
             font-size: 13px;
+            position: relative;
         }
         
         .project-item:hover {
@@ -95,13 +96,31 @@
             word-wrap: break-word;
         }
 
-        /* MODIFICATION: Added style for the timestamp */
         .project-timestamp {
             color: #9b9b9b;
             font-size: 11px;
             margin-top: 4px;
         }
         
+        /* MODIFICATION START: Added style for the delete button */
+        .delete-project-btn {
+            position: absolute;
+            top: 5px;
+            right: 8px;
+            color: #808080;
+            font-weight: bold;
+            cursor: pointer;
+            padding: 0 5px;
+            font-size: 20px;
+            line-height: 1;
+            transition: color 0.2s;
+        }
+        
+        .delete-project-btn:hover {
+            color: #ff6b6b;
+        }
+        /* MODIFICATION END */
+
         .tabs {
             display: flex;
             background-color: #3c3f41;
@@ -219,6 +238,8 @@
             border-top: 1px solid #555;
             font-size: 12px;
             color: #808080;
+            display: flex;
+            align-items: center;
         }
         
         .connection-status {
@@ -283,6 +304,7 @@
         
         <div class="status-bar">
             WebSocket: <span class="connection-status disconnected" id="connectionStatus">DISCONNECTED</span>
+            <button id="reconnectBtn" style="margin-left: 10px; background-color: #4c5052; border: 1px solid #6b7075; color: #a9b7c6; border-radius: 3px; cursor: pointer; padding: 2px 6px; font-size: 10px;">Reconnect</button>
             <span id="statusText" style="margin-left: 20px;"></span>
         </div>
     </div>
@@ -302,7 +324,6 @@
 
             async initDB() {
                 return new Promise((resolve, reject) => {
-                    // MODIFICATION: Bumped DB version to 3 for schema change.
                     const request = indexedDB.open('CodeAnalyzer', 3);
                     
                     request.onerror = () => reject(request.error);
@@ -312,16 +333,13 @@
                         resolve();
                     };
                     
-                    // MODIFICATION: Updated schema upgrade logic.
                     request.onupgradeneeded = (event) => {
                         const db = event.target.result;
                         const transaction = event.target.transaction;
                         
-                        // Handle initial creation and upgrade from version 1 to 2
                         if (event.oldVersion < 2) {
                             if (!db.objectStoreNames.contains('projects')) {
                                 const projectStore = db.createObjectStore('projects', { keyPath: 'id', autoIncrement: true });
-                                // This unique index will be replaced by the v3 upgrade logic
                                 projectStore.createIndex('path', 'path', { unique: true });
                                 projectStore.createIndex('name', 'name', { unique: false });
                             }
@@ -337,13 +355,11 @@
                             }
                         }
 
-                        // Handle upgrade to version 3 (make path index non-unique)
                         if (event.oldVersion < 3) {
                             const projectStore = transaction.objectStore('projects');
                             if (projectStore.indexNames.contains('path')) {
                                 projectStore.deleteIndex('path');
                             }
-                            // Recreate the 'path' index to allow duplicates
                             projectStore.createIndex('path', 'path', { unique: false });
                         }
                     };
@@ -351,7 +367,6 @@
             }
 
             initUI() {
-                // Tab switching
                 document.querySelectorAll('.tab').forEach(tab => {
                     tab.addEventListener('click', () => {
                         this.switchToView(tab.getAttribute('data-view'));
@@ -367,6 +382,15 @@
                         alert('Please enter a project path.');
                     }
                 });
+                
+                // MODIFICATION START: Added event listener for the reconnect button
+                document.getElementById('reconnectBtn').addEventListener('click', () => {
+                    if (!this.ws || this.ws.readyState === WebSocket.CLOSED) {
+                        this.updateStatus('Attempting to reconnect...');
+                        this.connectWebSocket();
+                    }
+                });
+                // MODIFICATION END
             }
 
             connectWebSocket() {
@@ -381,8 +405,8 @@
                 this.ws.onclose = () => {
                     document.getElementById('connectionStatus').textContent = 'DISCONNECTED';
                     document.getElementById('connectionStatus').className = 'connection-status disconnected';
-                    this.updateStatus('Disconnected from backend');
-                    setTimeout(() => this.connectWebSocket(), 5000);
+                    this.updateStatus('Disconnected from backend. Use Reconnect button.');
+                    // Removed automatic reconnect in favor of the manual button
                 };
                 
                 this.ws.onmessage = (event) => {
@@ -412,13 +436,11 @@
                 const projectData = {
                     name: projectName,
                     path: projectPath,
-                    lastOpened: new Date().toISOString() // This will serve as the analysis timestamp
+                    lastOpened: new Date().toISOString()
                 };
 
-                // Save a NEW project record for this specific analysis run and get its unique ID.
                 this.currentProject = await this.saveProject(projectData);
 
-                // Reset state for the new analysis
                 this.currentResults = [];
                 this.currentProgressLog = [];
                 
@@ -438,19 +460,16 @@
                 }
             }
 
-            // MODIFICATION: This function now ALWAYS adds a new project record.
             async saveProject(project) {
                 return new Promise((resolve, reject) => {
                     const transaction = this.db.transaction(['projects'], 'readwrite');
                     const store = transaction.objectStore('projects');
                     
-                    // Always add a new project record to store this analysis run separately.
                     const addRequest = store.add(project);
                     
                     addRequest.onerror = () => reject(addRequest.error);
                     
                     addRequest.onsuccess = (event) => {
-                        // Retrieve the full project object, now with its unique auto-generated ID
                         const getRequest = store.get(event.target.result);
                         getRequest.onsuccess = () => {
                             this.loadProjects();
@@ -485,27 +504,71 @@
                     const li = document.createElement('li');
                     li.className = 'project-item';
                     
-                    // MODIFICATION: Added timestamp to the display item.
+                    // MODIFICATION START: Added delete button span to the innerHTML
                     li.innerHTML = `
+                        <span class="delete-project-btn" title="Delete Analysis">&times;</span>
                         <div class="project-name">${project.name}</div>
                         <div class="project-path">${project.path}</div>
                         <div class="project-timestamp">${new Date(project.lastOpened).toLocaleString()}</div>
                     `;
                     
+                    // Main click event to load the analysis
                     li.addEventListener('click', () => {
-                        // Load the specific analysis for this project entry
                         this.loadAnalysisForProject(project);
                     });
+                    
+                    // Click event specifically for the delete button
+                    const deleteBtn = li.querySelector('.delete-project-btn');
+                    deleteBtn.addEventListener('click', (event) => {
+                        event.stopPropagation(); // Prevents the li's click event from firing
+                        this.deleteAnalysis(project.id);
+                    });
+                    // MODIFICATION END
                     
                     projectList.appendChild(li);
                 });
             }
+            
+            // MODIFICATION START: New method to delete an analysis from IndexedDB
+            async deleteAnalysis(projectId) {
+                if (!confirm('Are you sure you want to delete this analysis history? This action cannot be undone.')) {
+                    return;
+                }
+                
+                const transaction = this.db.transaction(['projects', 'analyses'], 'readwrite');
+                
+                transaction.oncomplete = () => {
+                    this.loadProjects(); // Refresh the list from the DB
+                    this.updateStatus('Analysis deleted.');
+                };
+                transaction.onerror = (event) => {
+                    console.error('Error deleting analysis:', event.target.error);
+                    this.updateStatus('Error deleting analysis.');
+                };
+
+                // Delete project from 'projects' store
+                const projectStore = transaction.objectStore('projects');
+                projectStore.delete(projectId);
+                
+                // Find and delete associated analyses from 'analyses' store
+                const analysisStore = transaction.objectStore('analyses');
+                const analysisIndex = analysisStore.index('projectId');
+                const request = analysisIndex.openCursor(IDBKeyRange.only(projectId));
+                
+                request.onsuccess = (event) => {
+                    const cursor = event.target.result;
+                    if (cursor) {
+                        cursor.delete();
+                        cursor.continue();
+                    }
+                };
+            }
+            // MODIFICATION END
 
             async loadAnalysisForProject(project) {
                 const transaction = this.db.transaction(['analyses'], 'readonly');
                 const store = transaction.objectStore('analyses');
                 const index = store.index('projectId');
-                // Get all analyses for this project ID (should only be one with the new model)
                 const request = index.getAll(project.id);
                 
                 request.onerror = (e) => console.error("Error loading analysis:", e);
@@ -513,7 +576,6 @@
                 request.onsuccess = () => {
                     const analyses = request.result;
                     if (analyses && analyses.length > 0) {
-                        // In case there are multiple for any reason, always show the latest.
                         analyses.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
                         const latestAnalysis = analyses[0];
                         this.displayStoredAnalysis(latestAnalysis);
@@ -532,16 +594,14 @@
                 this.clearProgressView();
                 this.clearResultsView();
 
-                // Display stored progress log
                 analysis.progressLog.forEach(log => this._renderProgressUpdate(log));
                 
-                // Display stored findings
                 if (analysis.findings && analysis.findings.length > 0) {
                     analysis.findings.forEach(finding => this._renderFinding(finding));
                     this.switchToView('results');
                 } else {
                     document.getElementById('resultsView').innerHTML = '<div class="empty-state">No issues were found in this analysis run.</div>';
-                    this.switchToView('progress'); // Stay on progress view if no results
+                    this.switchToView('progress');
                 }
             }
 
@@ -641,7 +701,7 @@
                 this.addProgressUpdate(errorMessage);
                 this.updateStatus('Analysis failed');
                 if (this.currentProject) {
-                    this.saveCurrentAnalysis(); // Save the failed run with the error message
+                    this.saveCurrentAnalysis();
                 }
             }
 
@@ -661,7 +721,6 @@
             }
         }
 
-        // Initialize the application
         const codeAnalyzer = new CodeAnalyzer();
     </script>
 </body>
