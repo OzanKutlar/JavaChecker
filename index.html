@@ -245,8 +245,10 @@
 </head>
 <body>
     <div class="sidebar">
-        <button class="open-project-btn" id="openProjectBtn">📁 Open Project</button>
-        <input type="file" id="folderInput" webkitdirectory style="display: none;">
+        <div class="project-input-group" style="margin-bottom: 20px;">
+			<input type="text" id="projectPathInput" placeholder="Enter full project path..." style="width: 100%; padding: 12px; background-color: #4c5052; border: 1px solid #6b7075; border-radius: 4px; color: #a9b7c6;">
+			<button class="open-project-btn" id="analyzeBtn" style="margin-top: 10px;">🔍 Analyze Project</button>
+		</div>
         
         <div class="projects-section">
             <h3>Recent Projects</h3>
@@ -331,18 +333,17 @@
                     });
                 });
 
-                // Project folder selection
-                document.getElementById('openProjectBtn').addEventListener('click', () => {
-                    document.getElementById('folderInput').click();
-                });
-
-                document.getElementById('folderInput').addEventListener('change', (event) => {
-                    if (event.target.files.length > 0) {
-                        const file = event.target.files[0];
-                        const projectPath = file.webkitRelativePath.split('/')[0];
-                        this.openProject(projectPath, file.webkitRelativePath);
-                    }
-                });
+				
+				document.getElementById('analyzeBtn').addEventListener('click', () => {
+					const projectPath = document.getElementById('projectPathInput').value.trim();
+					if (projectPath) {
+						// Extract the project name from the path (e.g., "MyProject" from "C:/.../MyProject")
+						const projectName = projectPath.split(/[\\\/]/).pop(); 
+						this.openProject(projectName, projectPath);
+					} else {
+						alert('Please enter a project path.');
+					}
+				});
             }
 
             connectWebSocket() {
@@ -386,35 +387,34 @@
                 }
             }
 
-            async openProject(projectName, samplePath) {
-                const projectPath = samplePath.substring(0, samplePath.indexOf('/'));
-                
-                // Save project to IndexedDB
-                const project = {
-                    name: projectName,
-                    path: projectPath,
-                    lastOpened: new Date().toISOString()
-                };
-                
-                await this.saveProject(project);
-                this.currentProject = project;
-                this.currentResults = [];
-                
-                // Clear previous results
-                this.clearProgressView();
-                this.clearResultsView();
-                
-                // Send project path to backend
-                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                    this.ws.send(JSON.stringify({
-                        type: 'analyze_project',
-                        path: projectPath
-                    }));
-                    this.updateStatus(`Analyzing project: ${projectName}`);
-                } else {
-                    this.updateStatus('Not connected to backend');
-                }
-            }
+            // MODIFY the openProject method slightly
+			async openProject(projectName, projectPath) { // The second parameter is now the full path
+				// Save project to IndexedDB
+				const project = {
+					name: projectName,
+					path: projectPath, // Store the full path
+					lastOpened: new Date().toISOString()
+				};
+				
+				await this.saveProject(project);
+				this.currentProject = project;
+				this.currentResults = [];
+				
+				// Clear previous results
+				this.clearProgressView();
+				this.clearResultsView();
+				
+				// Send the FULL project path to the backend
+				if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+					this.ws.send(JSON.stringify({
+						type: 'analyze_project',
+						path: projectPath // Send the full path string
+					}));
+					this.updateStatus(`Analyzing project: ${projectName}`);
+				} else {
+					this.updateStatus('Not connected to backend');
+				}
+			}
 
             async saveProject(project) {
                 return new Promise((resolve, reject) => {
