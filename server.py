@@ -549,5 +549,10 @@ if __name__ == "__main__":
         print("pip install websockets")
         exit(1)
     
+    index_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
+
+    if os.path.exists(index_file):
+        os.startfile(index_file)
+    
     # Run the server
     asyncio.run(main())
