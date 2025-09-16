@@ -52,6 +52,7 @@ class CodeChecker(ABC):
             - description: description of the issue
             - codeLines: list of dict with 'number' and 'content' keys
             - problemLineIndex: index in codeLines of the problematic line
+            - callTrace: (Optional) list of dicts representing the call stack
         """
         pass
     
@@ -125,15 +126,24 @@ class ExceptionChecker(CodeChecker):
             await progress_callback("No Java files found in project")
             return findings
         
-        await progress_callback(f"Found {len(java_files)} Java files to analyze")
+        await progress_callback(f"Found {len(java_files)} Java files to analyze. Pre-parsing files...")
         
+        # Pre-load all file contents for faster analysis
+        all_files_content = {}
+        for file_path in java_files:
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    all_files_content[file_path] = f.read().splitlines()
+            except Exception as e:
+                await progress_callback(f"Could not read {os.path.basename(file_path)}: {e}")
+
         # Analyze each file
-        for i, file_path in enumerate(java_files, 1):
+        for i, file_path in enumerate(all_files_content.keys(), 1):
             relative_path = os.path.relpath(file_path, project_path)
-            await progress_callback(f"Checking file {i}/{len(java_files)}: {relative_path}")
+            await progress_callback(f"Checking file {i}/{len(all_files_content)}: {relative_path}")
             
             try:
-                file_findings = await self._analyze_file(file_path, project_path)
+                file_findings = await self._analyze_file(file_path, project_path, all_files_content)
                 findings.extend(file_findings)
             except Exception as e:
                 await progress_callback(f"Error analyzing {relative_path}: {str(e)}")
@@ -141,38 +151,127 @@ class ExceptionChecker(CodeChecker):
         await progress_callback(f"Exception checking complete. Found {len(findings)} issues.")
         return findings
     
-    async def _analyze_file(self, file_path: str, project_path: str) -> List[Dict[str, Any]]:
+    async def _analyze_file(self, file_path: str, project_path: str, all_files: Dict[str, List[str]]) -> List[Dict[str, Any]]:
         """Analyze a single Java file for exception-prone calls."""
         findings = []
-        
-        try:
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-                lines = content.split('\n')
-        except Exception as e:
-            return findings  # Skip files that can't be read
-        
+        lines = all_files.get(file_path, [])
+        if not lines:
+            return findings
+
         relative_path = os.path.relpath(file_path, project_path)
         
         # Check each line for exception-prone patterns
         for line_num, line in enumerate(lines, 1):
             for pattern in self.EXCEPTION_PRONE_PATTERNS:
-                matches = re.finditer(pattern, line)
-                for match in matches:
+                for match in re.finditer(pattern, line):
                     # Check if this call is in a try-catch block
                     if not self._is_in_try_catch_block(lines, line_num - 1):
+                        call_trace = await self._build_call_trace(all_files, file_path, line_num -1, project_path)
                         finding = {
                             'file': relative_path,
                             'line': line_num,
                             'column': match.start() + 1,
-                            'description': f'Exception-prone call "{match.group()}" not wrapped in try-catch',
+                            'description': f'Exception-prone call "{match.group().strip()}" not wrapped in try-catch',
                             'codeLines': self._get_code_context(lines, line_num - 1),
-                            'problemLineIndex': 5  # The problematic line is in the middle (5 lines before + current)
+                            'problemLineIndex': 5,
+                            'callTrace': call_trace
                         }
                         findings.append(finding)
         
         return findings
-    
+
+    def _get_enclosing_method_details(self, lines: List[str], line_index: int) -> Optional[Dict[str, Any]]:
+        """Find the details of the method enclosing the given line index."""
+        brace_count = 0
+        method_pattern = re.compile(r'(public|private|protected|static|\s)*[\w\<\>\[\]]+\s+(\w+)\s*\([^)]*\)\s*(throws\s+[\w,\s]+)?\s*{?')
+        
+        for i in range(line_index, -1, -1):
+            line = lines[i]
+            if '}' in line:
+                brace_count += line.count('}')
+            if '{' in line:
+                brace_count -= line.count('{')
+            
+            if brace_count > 0: # Moved out of the current scope
+                return None
+
+            match = method_pattern.search(line)
+            if match:
+                method_name = match.group(2)
+                signature = ' '.join(line.strip().split()) # a cleaned up version of the line
+                return {
+                    "name": method_name,
+                    "signature": signature.replace('{', '').strip(),
+                    "start_line": i
+                }
+        return None
+
+    def _find_method_callers(self, all_files: Dict[str, List[str]], method_name: str, project_path: str) -> List[Dict[str, Any]]:
+        """Find all call sites for a given method name. NOTE: This is a simple regex search and may have false positives."""
+        callers = []
+        # This regex looks for the method name followed by parentheses, avoiding definition keywords
+        caller_pattern = re.compile(r'\b' + re.escape(method_name) + r'\s*\(')
+        
+        for file_path, lines in all_files.items():
+            for line_num, line in enumerate(lines, 1):
+                # Basic check to avoid matching the method definition itself
+                if any(keyword in line for keyword in ['public', 'private', 'protected', 'class', 'interface']):
+                    if re.search(r'\s+' + re.escape(method_name) + r'\s*\(', line):
+                        continue
+                
+                for match in caller_pattern.finditer(line):
+                    callers.append({
+                        "file": os.path.relpath(file_path, project_path),
+                        "abs_path": file_path,
+                        "line": line_num,
+                        "column": match.start() + 1,
+                    })
+        return callers
+
+    async def _build_call_trace(self, all_files: Dict[str, List[str]], initial_file_path: str, initial_line_index: int, project_path: str, max_depth=5) -> List[Dict[str, Any]]:
+        """Builds a call trace starting from a specific line of code."""
+        trace = []
+        visited = set()
+        
+        current_file_path = initial_file_path
+        current_line_index = initial_line_index
+
+        for _ in range(max_depth):
+            if (current_file_path, current_line_index) in visited:
+                break
+            visited.add((current_file_path, current_line_index))
+
+            lines = all_files.get(current_file_path, [])
+            enclosing_method = self._get_enclosing_method_details(lines, current_line_index)
+
+            if not enclosing_method or 'main' in enclosing_method['signature']:
+                break
+
+            method_name = enclosing_method['name']
+            callers = self._find_method_callers(all_files, method_name, project_path)
+
+            if not callers:
+                break
+
+            # For simplicity, we just take the first caller found. A real tool would need to resolve which one is correct.
+            caller = callers[0]
+            
+            caller_lines = all_files.get(caller['abs_path'], [])
+            trace.append({
+                'file': caller['file'],
+                'line': caller['line'],
+                'column': caller['column'],
+                'signature': enclosing_method['signature'],
+                'codeLines': self._get_code_context(caller_lines, caller['line'] - 1),
+                'problemLineIndex': 5,
+            })
+            
+            # Set up for the next iteration
+            current_file_path = caller['abs_path']
+            current_line_index = caller['line'] - 1
+
+        return trace
+
     def _is_in_try_catch_block(self, lines: List[str], line_index: int) -> bool:
         """
         Check if the given line is within a try-catch block.
@@ -187,53 +286,21 @@ class ExceptionChecker(CodeChecker):
         # Look backwards from current line
         for i in range(line_index, -1, -1):
             line = lines[i].strip()
-            
-            # Count braces to track scope
             brace_count += line.count('}') - line.count('{')
-            
-            # If we've gone up a scope level, stop looking in current method
-            if brace_count > 0:
-                # Check if we're now in an outer method or main
-                for j in range(i, -1, -1):
-                    outer_line = lines[j].strip()
-                    if 'public static void main' in outer_line:
-                        return False  # Reached main without finding try-catch
-                    if re.search(r'(public|private|protected).*\w+\s*\([^)]*\)\s*{?', outer_line):
-                        # Found another method, continue checking from there
-                        return self._check_method_scope(lines, j, line_index)
-                break
-            
-            # Look for try keyword
+            if brace_count > 0: break
             if 'try' in line and '{' in line:
                 found_try = True
                 break
-            
-            # If we hit a method signature, check if it's main
-            if re.search(r'(public|private|protected).*\w+\s*\([^)]*\)', line):
-                if 'public static void main' in line:
-                    return False  # Reached main method
-                break
         
         if found_try:
-            # Look forward from the try to see if there's a corresponding catch
             brace_count = 0
             in_try_block = True
-            
             for i in range(line_index, len(lines)):
                 line = lines[i].strip()
                 brace_count += line.count('{') - line.count('}')
-                
-                # If we're at the end of the try block
-                if in_try_block and brace_count < 0:
-                    in_try_block = False
-                
-                # Look for catch block
-                if not in_try_block and ('catch' in line or 'finally' in line):
-                    return True
-                
-                # If we've closed all braces and no catch found
-                if not in_try_block and brace_count <= -2:
-                    break
+                if in_try_block and brace_count < 0: in_try_block = False
+                if not in_try_block and ('catch' in line or 'finally' in line): return True
+                if not in_try_block and brace_count <= -2: break
         
         return False
     
