@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Code Analyzer</title>
+    <style>
+        /*
+         * Code Analyzer Frontend - Darcula Dark Theme
+         * A standalone HTML/JS application that provides a dark-themed interface for code analysis.
+         * Features a project browser on the left and live progress/results on the right.
+         * Uses IndexedDB for persistent storage of project history and results.
+         * Communicates with Python backend via WebSocket for real-time updates.
+         */
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'JetBrains Mono', 'Consolas', monospace;
+            background-color: #2b2b2b;
+            color: #a9b7c6;
+            height: 100vh;
+            display: flex;
+        }
+        
+        .sidebar {
+            width: 300px;
+            background-color: #3c3f41;
+            border-right: 1px solid #555;
+            padding: 20px;
+            overflow-y: auto;
+        }
+        
+        .main-content {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            background-color: #2b2b2b;
+        }
+        
+        .open-project-btn {
+            width: 100%;
+            padding: 12px;
+            background-color: #4c5052;
+            color: #a9b7c6;
+            border: 1px solid #6b7075;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            margin-bottom: 20px;
+            transition: background-color 0.2s;
+        }
+        
+        .open-project-btn:hover {
+            background-color: #5c6062;
+        }
+        
+        .projects-section h3 {
+            color: #ffc66d;
+            margin-bottom: 10px;
+            font-size: 16px;
+        }
+        
+        .project-list {
+            list-style: none;
+        }
+        
+        .project-item {
+            padding: 10px;
+            margin-bottom: 5px;
+            background-color: #4c5052;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            font-size: 13px;
+        }
+        
+        .project-item:hover {
+            background-color: #5c6062;
+        }
+        
+        .project-name {
+            font-weight: bold;
+            color: #cc7832;
+        }
+        
+        .project-path {
+            color: #808080;
+            font-size: 11px;
+            margin-top: 2px;
+        }
+        
+        .tabs {
+            display: flex;
+            background-color: #3c3f41;
+            border-bottom: 1px solid #555;
+        }
+        
+        .tab {
+            padding: 12px 20px;
+            cursor: pointer;
+            color: #a9b7c6;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s;
+        }
+        
+        .tab.active {
+            color: #ffc66d;
+            border-bottom-color: #ffc66d;
+            background-color: #2b2b2b;
+        }
+        
+        .tab:hover:not(.active) {
+            background-color: #4c5052;
+        }
+        
+        .content-area {
+            flex: 1;
+            padding: 20px;
+            overflow-y: auto;
+        }
+        
+        .progress-view, .results-view {
+            display: none;
+        }
+        
+        .progress-view.active, .results-view.active {
+            display: block;
+        }
+        
+        .progress-item {
+            padding: 8px 12px;
+            margin-bottom: 5px;
+            background-color: #3c3f41;
+            border-radius: 4px;
+            font-family: monospace;
+            font-size: 13px;
+            border-left: 3px solid #6897bb;
+        }
+        
+        .finding {
+            margin-bottom: 20px;
+            background-color: #3c3f41;
+            border-radius: 8px;
+            border-left: 4px solid #cc7832;
+            overflow: hidden;
+        }
+        
+        .finding-header {
+            padding: 12px 16px;
+            background-color: #4c5052;
+            border-bottom: 1px solid #555;
+        }
+        
+        .finding-position {
+            color: #ffc66d;
+            font-weight: bold;
+            font-size: 14px;
+        }
+        
+        .finding-description {
+            color: #a9b7c6;
+            margin-top: 4px;
+            font-size: 13px;
+        }
+        
+        .code-viewer {
+            background-color: #2b2b2b;
+            padding: 0;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+        
+        .code-line {
+            display: flex;
+            padding: 2px 16px;
+            border-bottom: 1px solid #3c3f41;
+        }
+        
+        .line-number {
+            width: 40px;
+            color: #606366;
+            text-align: right;
+            margin-right: 16px;
+            user-select: none;
+        }
+        
+        .line-content {
+            flex: 1;
+            color: #a9b7c6;
+            white-space: pre;
+        }
+        
+        .code-line.problem-line {
+            background-color: #5c2626;
+        }
+        
+        .code-line.problem-line .line-number {
+            color: #ff6b6b;
+            font-weight: bold;
+        }
+        
+        .status-bar {
+            padding: 8px 20px;
+            background-color: #3c3f41;
+            border-top: 1px solid #555;
+            font-size: 12px;
+            color: #808080;
+        }
+        
+        .connection-status {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 10px;
+            font-weight: bold;
+        }
+        
+        .connection-status.connected {
+            background-color: #365c36;
+            color: #6cc46c;
+        }
+        
+        .connection-status.disconnected {
+            background-color: #5c2626;
+            color: #ff6b6b;
+        }
+        
+        .empty-state {
+            text-align: center;
+            color: #808080;
+            font-style: italic;
+            margin-top: 50px;
+        }
+        
+        .hidden {
+            display: none !important;
+        }
+    </style>
+</head>
+<body>
+    <div class="sidebar">
+        <button class="open-project-btn" id="openProjectBtn">📁 Open Project</button>
+        <input type="file" id="folderInput" webkitdirectory style="display: none;">
+        
+        <div class="projects-section">
+            <h3>Recent Projects</h3>
+            <ul class="project-list" id="projectList">
+                <li class="empty-state">No recent projects</li>
+            </ul>
+        </div>
+    </div>
+    
+    <div class="main-content">
+        <div class="tabs">
+            <div class="tab active" data-view="progress">Progress</div>
+            <div class="tab" data-view="results">Results</div>
+        </div>
+        
+        <div class="content-area">
+            <div class="progress-view active" id="progressView">
+                <div class="empty-state">Connect to backend and open a project to begin analysis</div>
+            </div>
+            
+            <div class="results-view" id="resultsView">
+                <div class="empty-state">No issues found yet</div>
+            </div>
+        </div>
+        
+        <div class="status-bar">
+            WebSocket: <span class="connection-status disconnected" id="connectionStatus">DISCONNECTED</span>
+            <span id="statusText" style="margin-left: 20px;"></span>
+        </div>
+    </div>
+
+    <script>
+        class CodeAnalyzer {
+            constructor() {
+                this.ws = null;
+                this.db = null;
+                this.currentProject = null;
+                this.currentResults = [];
+                this.initDB();
+                this.initUI();
+                this.connectWebSocket();
+            }
+
+            async initDB() {
+                return new Promise((resolve, reject) => {
+                    const request = indexedDB.open('CodeAnalyzer', 1);
+                    
+                    request.onerror = () => reject(request.error);
+                    request.onsuccess = () => {
+                        this.db = request.result;
+                        this.loadProjects();
+                        resolve();
+                    };
+                    
+                    request.onupgradeneeded = (event) => {
+                        const db = event.target.result;
+                        
+                        if (!db.objectStoreNames.contains('projects')) {
+                            const projectStore = db.createObjectStore('projects', { keyPath: 'id', autoIncrement: true });
+                            projectStore.createIndex('path', 'path', { unique: true });
+                            projectStore.createIndex('name', 'name', { unique: false });
+                        }
+                        
+                        if (!db.objectStoreNames.contains('results')) {
+                            const resultsStore = db.createObjectStore('results', { keyPath: 'id', autoIncrement: true });
+                            resultsStore.createIndex('projectId', 'projectId', { unique: false });
+                        }
+                    };
+                });
+            }
+
+            initUI() {
+                // Tab switching
+                document.querySelectorAll('.tab').forEach(tab => {
+                    tab.addEventListener('click', () => {
+                        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                        document.querySelectorAll('.progress-view, .results-view').forEach(v => v.classList.remove('active'));
+                        
+                        tab.classList.add('active');
+                        const view = tab.getAttribute('data-view');
+                        document.getElementById(view + 'View').classList.add('active');
+                    });
+                });
+
+                // Project folder selection
+                document.getElementById('openProjectBtn').addEventListener('click', () => {
+                    document.getElementById('folderInput').click();
+                });
+
+                document.getElementById('folderInput').addEventListener('change', (event) => {
+                    if (event.target.files.length > 0) {
+                        const file = event.target.files[0];
+                        const projectPath = file.webkitRelativePath.split('/')[0];
+                        this.openProject(projectPath, file.webkitRelativePath);
+                    }
+                });
+            }
+
+            connectWebSocket() {
+                this.ws = new WebSocket('ws://localhost:8765');
+                
+                this.ws.onopen = () => {
+                    document.getElementById('connectionStatus').textContent = 'CONNECTED';
+                    document.getElementById('connectionStatus').className = 'connection-status connected';
+                    this.updateStatus('Connected to backend');
+                };
+                
+                this.ws.onclose = () => {
+                    document.getElementById('connectionStatus').textContent = 'DISCONNECTED';
+                    document.getElementById('connectionStatus').className = 'connection-status disconnected';
+                    this.updateStatus('Disconnected from backend');
+                    
+                    // Attempt to reconnect after 5 seconds
+                    setTimeout(() => this.connectWebSocket(), 5000);
+                };
+                
+                this.ws.onmessage = (event) => {
+                    const message = JSON.parse(event.data);
+                    this.handleWebSocketMessage(message);
+                };
+            }
+
+            handleWebSocketMessage(message) {
+                switch (message.type) {
+                    case 'progress':
+                        this.addProgressUpdate(message.data);
+                        break;
+                    case 'finding':
+                        this.addFinding(message.data);
+                        break;
+                    case 'complete':
+                        this.handleAnalysisComplete();
+                        break;
+                    case 'error':
+                        this.handleError(message.data);
+                        break;
+                }
+            }
+
+            async openProject(projectName, samplePath) {
+                const projectPath = samplePath.substring(0, samplePath.indexOf('/'));
+                
+                // Save project to IndexedDB
+                const project = {
+                    name: projectName,
+                    path: projectPath,
+                    lastOpened: new Date().toISOString()
+                };
+                
+                await this.saveProject(project);
+                this.currentProject = project;
+                this.currentResults = [];
+                
+                // Clear previous results
+                this.clearProgressView();
+                this.clearResultsView();
+                
+                // Send project path to backend
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    this.ws.send(JSON.stringify({
+                        type: 'analyze_project',
+                        path: projectPath
+                    }));
+                    this.updateStatus(`Analyzing project: ${projectName}`);
+                } else {
+                    this.updateStatus('Not connected to backend');
+                }
+            }
+
+            async saveProject(project) {
+                return new Promise((resolve, reject) => {
+                    const transaction = this.db.transaction(['projects'], 'readwrite');
+                    const store = transaction.objectStore('projects');
+                    
+                    // Check if project already exists
+                    const index = store.index('path');
+                    const request = index.get(project.path);
+                    
+                    request.onsuccess = () => {
+                        if (request.result) {
+                            // Update existing project
+                            const updateRequest = store.put({
+                                ...request.result,
+                                lastOpened: project.lastOpened
+                            });
+                            updateRequest.onsuccess = () => {
+                                this.loadProjects();
+                                resolve();
+                            };
+                        } else {
+                            // Add new project
+                            const addRequest = store.add(project);
+                            addRequest.onsuccess = () => {
+                                this.loadProjects();
+                                resolve();
+                            };
+                        }
+                    };
+                    
+                    request.onerror = () => reject(request.error);
+                });
+            }
+
+            async loadProjects() {
+                return new Promise((resolve, reject) => {
+                    const transaction = this.db.transaction(['projects'], 'readonly');
+                    const store = transaction.objectStore('projects');
+                    const request = store.getAll();
+                    
+                    request.onsuccess = () => {
+                        const projects = request.result.sort((a, b) => 
+                            new Date(b.lastOpened) - new Date(a.lastOpened)
+                        );
+                        this.displayProjects(projects);
+                        resolve();
+                    };
+                    
+                    request.onerror = () => reject(request.error);
+                });
+            }
+
+            displayProjects(projects) {
+                const projectList = document.getElementById('projectList');
+                projectList.innerHTML = '';
+                
+                if (projects.length === 0) {
+                    projectList.innerHTML = '<li class="empty-state">No recent projects</li>';
+                    return;
+                }
+                
+                projects.forEach(project => {
+                    const li = document.createElement('li');
+                    li.className = 'project-item';
+                    li.innerHTML = `
+                        <div class="project-name">${project.name}</div>
+                        <div class="project-path">${project.path}</div>
+                    `;
+                    
+                    li.addEventListener('click', () => {
+                        this.loadProjectResults(project);
+                    });
+                    
+                    projectList.appendChild(li);
+                });
+            }
+
+            async loadProjectResults(project) {
+                // Implementation for loading saved results would go here
+                this.updateStatus(`Loaded project: ${project.name}`);
+            }
+
+            addProgressUpdate(progress) {
+                const progressView = document.getElementById('progressView');
+                const emptyState = progressView.querySelector('.empty-state');
+                if (emptyState) emptyState.remove();
+                
+                const progressItem = document.createElement('div');
+                progressItem.className = 'progress-item';
+                progressItem.textContent = progress;
+                
+                progressView.appendChild(progressItem);
+                progressView.scrollTop = progressView.scrollHeight;
+            }
+
+            addFinding(finding) {
+                const resultsView = document.getElementById('resultsView');
+                const emptyState = resultsView.querySelector('.empty-state');
+                if (emptyState) emptyState.remove();
+                
+                this.currentResults.push(finding);
+                
+                const findingElement = document.createElement('div');
+                findingElement.className = 'finding';
+                
+                findingElement.innerHTML = `
+                    <div class="finding-header">
+                        <div class="finding-position">${finding.file}:${finding.line}:${finding.column}</div>
+                        <div class="finding-description">${finding.description}</div>
+                    </div>
+                    <div class="code-viewer">
+                        ${this.renderCodeLines(finding.codeLines, finding.problemLineIndex)}
+                    </div>
+                `;
+                
+                resultsView.appendChild(findingElement);
+                resultsView.scrollTop = resultsView.scrollHeight;
+            }
+
+            renderCodeLines(lines, problemIndex) {
+                return lines.map((line, index) => {
+                    const lineNumber = line.number;
+                    const isProblemLine = index === problemIndex;
+                    
+                    return `
+                        <div class="code-line ${isProblemLine ? 'problem-line' : ''}">
+                            <div class="line-number">${lineNumber}</div>
+                            <div class="line-content">${this.escapeHtml(line.content)}</div>
+                        </div>
+                    `;
+                }).join('');
+            }
+
+            escapeHtml(text) {
+                const div = document.createElement('div');
+                div.textContent = text;
+                return div.innerHTML;
+            }
+
+            clearProgressView() {
+                const progressView = document.getElementById('progressView');
+                progressView.innerHTML = '<div class="empty-state">Analysis starting...</div>';
+            }
+
+            clearResultsView() {
+                const resultsView = document.getElementById('resultsView');
+                resultsView.innerHTML = '<div class="empty-state">Scanning for issues...</div>';
+            }
+
+            handleAnalysisComplete() {
+                this.addProgressUpdate('Analysis complete!');
+                this.updateStatus(`Analysis complete. Found ${this.currentResults.length} issues.`);
+                
+                // Save results if we have a current project
+                if (this.currentProject) {
+                    this.saveResults();
+                }
+            }
+
+            async saveResults() {
+                if (!this.currentProject || this.currentResults.length === 0) return;
+                
+                const resultsData = {
+                    projectId: this.currentProject.id,
+                    projectName: this.currentProject.name,
+                    projectPath: this.currentProject.path,
+                    results: this.currentResults,
+                    timestamp: new Date().toISOString()
+                };
+                
+                return new Promise((resolve, reject) => {
+                    const transaction = this.db.transaction(['results'], 'readwrite');
+                    const store = transaction.objectStore('results');
+                    const request = store.add(resultsData);
+                    
+                    request.onsuccess = () => resolve();
+                    request.onerror = () => reject(request.error);
+                });
+            }
+
+            handleError(error) {
+                this.addProgressUpdate(`Error: ${error}`);
+                this.updateStatus('Analysis failed');
+            }
+
+            updateStatus(message) {
+                document.getElementById('statusText').textContent = message;
+            }
+        }
+
+        // Initialize the application
+        const codeAnalyzer = new CodeAnalyzer();
+    </script>
+</body>
+</html>
