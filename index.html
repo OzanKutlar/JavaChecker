@@ -92,6 +92,14 @@
             color: #808080;
             font-size: 11px;
             margin-top: 2px;
+            word-wrap: break-word;
+        }
+
+        /* MODIFICATION: Added style for the timestamp */
+        .project-timestamp {
+            color: #9b9b9b;
+            font-size: 11px;
+            margin-top: 4px;
         }
         
         .tabs {
@@ -246,14 +254,13 @@
 <body>
     <div class="sidebar">
         <div class="project-input-group" style="margin-bottom: 20px;">
-			<input type="text" id="projectPathInput" placeholder="Enter full project path..." style="width: 100%; padding: 12px; background-color: #4c5052; border: 1px solid #6b7075; border-radius: 4px; color: #a9b7c6;">
-			<button class="open-project-btn" id="analyzeBtn" style="margin-top: 10px;">🔍 Analyze Project</button>
-		</div>
+            <input type="text" id="projectPathInput" placeholder="Enter full project path..." style="width: 100%; padding: 12px; background-color: #4c5052; border: 1px solid #6b7075; border-radius: 4px; color: #a9b7c6;">
+            <button class="open-project-btn" id="analyzeBtn" style="margin-top: 10px;">🔍 Analyze Project</button>
+        </div>
         
         <div class="projects-section">
-            <h3>Recent Projects</h3>
-            <ul class="project-list" id="projectList">
-                <li class="empty-state">No recent projects</li>
+            <h3>Recent Analyses</h3> <ul class="project-list" id="projectList">
+                <li class="empty-state">No recent analyses</li>
             </ul>
         </div>
     </div>
@@ -295,8 +302,8 @@
 
             async initDB() {
                 return new Promise((resolve, reject) => {
-                    // Bumped DB version to 2 to introduce the new 'analyses' store
-                    const request = indexedDB.open('CodeAnalyzer', 2);
+                    // MODIFICATION: Bumped DB version to 3 for schema change.
+                    const request = indexedDB.open('CodeAnalyzer', 3);
                     
                     request.onerror = () => reject(request.error);
                     request.onsuccess = () => {
@@ -305,24 +312,39 @@
                         resolve();
                     };
                     
+                    // MODIFICATION: Updated schema upgrade logic.
                     request.onupgradeneeded = (event) => {
                         const db = event.target.result;
+                        const transaction = event.target.transaction;
                         
-                        if (!db.objectStoreNames.contains('projects')) {
-                            const projectStore = db.createObjectStore('projects', { keyPath: 'id', autoIncrement: true });
-                            projectStore.createIndex('path', 'path', { unique: true });
-                            projectStore.createIndex('name', 'name', { unique: false });
-                        }
-                        
-                        // New schema for storing analysis runs
-                        if (event.oldVersion < 2 && db.objectStoreNames.contains('results')) {
-                            db.deleteObjectStore('results');
+                        // Handle initial creation and upgrade from version 1 to 2
+                        if (event.oldVersion < 2) {
+                            if (!db.objectStoreNames.contains('projects')) {
+                                const projectStore = db.createObjectStore('projects', { keyPath: 'id', autoIncrement: true });
+                                // This unique index will be replaced by the v3 upgrade logic
+                                projectStore.createIndex('path', 'path', { unique: true });
+                                projectStore.createIndex('name', 'name', { unique: false });
+                            }
+                            
+                            if (db.objectStoreNames.contains('results')) {
+                                db.deleteObjectStore('results');
+                            }
+
+                            if (!db.objectStoreNames.contains('analyses')) {
+                                const analysisStore = db.createObjectStore('analyses', { keyPath: 'id', autoIncrement: true });
+                                analysisStore.createIndex('projectId', 'projectId', { unique: false });
+                                analysisStore.createIndex('timestamp', 'timestamp', { unique: false });
+                            }
                         }
 
-                        if (!db.objectStoreNames.contains('analyses')) {
-                            const analysisStore = db.createObjectStore('analyses', { keyPath: 'id', autoIncrement: true });
-                            analysisStore.createIndex('projectId', 'projectId', { unique: false });
-                            analysisStore.createIndex('timestamp', 'timestamp', { unique: false });
+                        // Handle upgrade to version 3 (make path index non-unique)
+                        if (event.oldVersion < 3) {
+                            const projectStore = transaction.objectStore('projects');
+                            if (projectStore.indexNames.contains('path')) {
+                                projectStore.deleteIndex('path');
+                            }
+                            // Recreate the 'path' index to allow duplicates
+                            projectStore.createIndex('path', 'path', { unique: false });
                         }
                     };
                 });
@@ -336,15 +358,15 @@
                     });
                 });
 
-				document.getElementById('analyzeBtn').addEventListener('click', () => {
-					const projectPath = document.getElementById('projectPathInput').value.trim();
-					if (projectPath) {
-						const projectName = projectPath.split(/[\\\/]/).pop(); 
-						this.startNewAnalysis(projectName, projectPath);
-					} else {
-						alert('Please enter a project path.');
-					}
-				});
+                document.getElementById('analyzeBtn').addEventListener('click', () => {
+                    const projectPath = document.getElementById('projectPathInput').value.trim();
+                    if (projectPath) {
+                        const projectName = projectPath.split(/[\\\/]/).pop(); 
+                        this.startNewAnalysis(projectName, projectPath);
+                    } else {
+                        alert('Please enter a project path.');
+                    }
+                });
             }
 
             connectWebSocket() {
@@ -390,10 +412,10 @@
                 const projectData = {
                     name: projectName,
                     path: projectPath,
-                    lastOpened: new Date().toISOString()
+                    lastOpened: new Date().toISOString() // This will serve as the analysis timestamp
                 };
 
-                // Save/update the project and get the full object back, including its ID
+                // Save a NEW project record for this specific analysis run and get its unique ID.
                 this.currentProject = await this.saveProject(projectData);
 
                 // Reset state for the new analysis
@@ -416,33 +438,25 @@
                 }
             }
 
+            // MODIFICATION: This function now ALWAYS adds a new project record.
             async saveProject(project) {
                 return new Promise((resolve, reject) => {
                     const transaction = this.db.transaction(['projects'], 'readwrite');
                     const store = transaction.objectStore('projects');
-                    const index = store.index('path');
-                    const request = index.get(project.path);
                     
-                    request.onerror = () => reject(request.error);
+                    // Always add a new project record to store this analysis run separately.
+                    const addRequest = store.add(project);
                     
-                    request.onsuccess = () => {
-                        if (request.result) {
-                            // Project exists, update it
-                            const updatedProject = { ...request.result, lastOpened: project.lastOpened };
-                            const updateRequest = store.put(updatedProject);
-                            updateRequest.onsuccess = () => { this.loadProjects(); resolve(updatedProject); };
-                            updateRequest.onerror = () => reject(updateRequest.error);
-                        } else {
-                            // New project, add it
-                            const addRequest = store.add(project);
-                            addRequest.onerror = () => reject(addRequest.error);
-                            addRequest.onsuccess = (event) => {
-                                // Get the full project object back with the new ID
-                                const getRequest = store.get(event.target.result);
-                                getRequest.onsuccess = () => { this.loadProjects(); resolve(getRequest.result); };
-                                getRequest.onerror = () => reject(getRequest.error);
-                            };
-                        }
+                    addRequest.onerror = () => reject(addRequest.error);
+                    
+                    addRequest.onsuccess = (event) => {
+                        // Retrieve the full project object, now with its unique auto-generated ID
+                        const getRequest = store.get(event.target.result);
+                        getRequest.onsuccess = () => {
+                            this.loadProjects();
+                            resolve(getRequest.result);
+                        };
+                        getRequest.onerror = () => reject(getRequest.error);
                     };
                 });
             }
@@ -463,17 +477,23 @@
                 projectList.innerHTML = '';
                 
                 if (projects.length === 0) {
-                    projectList.innerHTML = '<li class="empty-state">No recent projects</li>';
+                    projectList.innerHTML = '<li class="empty-state">No recent analyses</li>';
                     return;
                 }
                 
                 projects.forEach(project => {
                     const li = document.createElement('li');
                     li.className = 'project-item';
-                    li.innerHTML = `<div class="project-name">${project.name}</div><div class="project-path">${project.path}</div>`;
+                    
+                    // MODIFICATION: Added timestamp to the display item.
+                    li.innerHTML = `
+                        <div class="project-name">${project.name}</div>
+                        <div class="project-path">${project.path}</div>
+                        <div class="project-timestamp">${new Date(project.lastOpened).toLocaleString()}</div>
+                    `;
                     
                     li.addEventListener('click', () => {
-                        // Load the last analysis for this project from the DB
+                        // Load the specific analysis for this project entry
                         this.loadAnalysisForProject(project);
                     });
                     
@@ -485,6 +505,7 @@
                 const transaction = this.db.transaction(['analyses'], 'readonly');
                 const store = transaction.objectStore('analyses');
                 const index = store.index('projectId');
+                // Get all analyses for this project ID (should only be one with the new model)
                 const request = index.getAll(project.id);
                 
                 request.onerror = (e) => console.error("Error loading analysis:", e);
@@ -492,6 +513,7 @@
                 request.onsuccess = () => {
                     const analyses = request.result;
                     if (analyses && analyses.length > 0) {
+                        // In case there are multiple for any reason, always show the latest.
                         analyses.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
                         const latestAnalysis = analyses[0];
                         this.displayStoredAnalysis(latestAnalysis);
@@ -500,8 +522,8 @@
                         this.clearProgressView();
                         this.clearResultsView();
                         this.switchToView('progress');
-                        document.getElementById('progressView').innerHTML = '<div class="empty-state">No analysis history found for this project.</div>';
-                        this.updateStatus(`No analysis history for ${project.name}`);
+                        document.getElementById('progressView').innerHTML = '<div class="empty-state">No analysis history found for this project run.</div>';
+                        this.updateStatus(`No analysis history for this run of ${project.name}`);
                     }
                 };
             }
@@ -519,7 +541,7 @@
                     this.switchToView('results');
                 } else {
                     document.getElementById('resultsView').innerHTML = '<div class="empty-state">No issues were found in this analysis run.</div>';
-                    this.switchToView('progress');
+                    this.switchToView('progress'); // Stay on progress view if no results
                 }
             }
 
