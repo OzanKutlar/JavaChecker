@@ -287,6 +287,7 @@
                 this.db = null;
                 this.currentProject = null;
                 this.currentResults = [];
+                this.currentProgressLog = [];
                 this.initDB();
                 this.initUI();
                 this.connectWebSocket();
@@ -294,7 +295,8 @@
 
             async initDB() {
                 return new Promise((resolve, reject) => {
-                    const request = indexedDB.open('CodeAnalyzer', 1);
+                    // Bumped DB version to 2 to introduce the new 'analyses' store
+                    const request = indexedDB.open('CodeAnalyzer', 2);
                     
                     request.onerror = () => reject(request.error);
                     request.onsuccess = () => {
@@ -312,9 +314,15 @@
                             projectStore.createIndex('name', 'name', { unique: false });
                         }
                         
-                        if (!db.objectStoreNames.contains('results')) {
-                            const resultsStore = db.createObjectStore('results', { keyPath: 'id', autoIncrement: true });
-                            resultsStore.createIndex('projectId', 'projectId', { unique: false });
+                        // New schema for storing analysis runs
+                        if (event.oldVersion < 2 && db.objectStoreNames.contains('results')) {
+                            db.deleteObjectStore('results');
+                        }
+
+                        if (!db.objectStoreNames.contains('analyses')) {
+                            const analysisStore = db.createObjectStore('analyses', { keyPath: 'id', autoIncrement: true });
+                            analysisStore.createIndex('projectId', 'projectId', { unique: false });
+                            analysisStore.createIndex('timestamp', 'timestamp', { unique: false });
                         }
                     };
                 });
@@ -324,22 +332,15 @@
                 // Tab switching
                 document.querySelectorAll('.tab').forEach(tab => {
                     tab.addEventListener('click', () => {
-                        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-                        document.querySelectorAll('.progress-view, .results-view').forEach(v => v.classList.remove('active'));
-                        
-                        tab.classList.add('active');
-                        const view = tab.getAttribute('data-view');
-                        document.getElementById(view + 'View').classList.add('active');
+                        this.switchToView(tab.getAttribute('data-view'));
                     });
                 });
 
-				
 				document.getElementById('analyzeBtn').addEventListener('click', () => {
 					const projectPath = document.getElementById('projectPathInput').value.trim();
 					if (projectPath) {
-						// Extract the project name from the path (e.g., "MyProject" from "C:/.../MyProject")
 						const projectName = projectPath.split(/[\\\/]/).pop(); 
-						this.openProject(projectName, projectPath);
+						this.startNewAnalysis(projectName, projectPath);
 					} else {
 						alert('Please enter a project path.');
 					}
@@ -359,8 +360,6 @@
                     document.getElementById('connectionStatus').textContent = 'DISCONNECTED';
                     document.getElementById('connectionStatus').className = 'connection-status disconnected';
                     this.updateStatus('Disconnected from backend');
-                    
-                    // Attempt to reconnect after 5 seconds
                     setTimeout(() => this.connectWebSocket(), 5000);
                 };
                 
@@ -386,86 +385,77 @@
                         break;
                 }
             }
+            
+            async startNewAnalysis(projectName, projectPath) {
+                const projectData = {
+                    name: projectName,
+                    path: projectPath,
+                    lastOpened: new Date().toISOString()
+                };
 
-            // MODIFY the openProject method slightly
-			async openProject(projectName, projectPath) { // The second parameter is now the full path
-				// Save project to IndexedDB
-				const project = {
-					name: projectName,
-					path: projectPath, // Store the full path
-					lastOpened: new Date().toISOString()
-				};
-				
-				await this.saveProject(project);
-				this.currentProject = project;
-				this.currentResults = [];
-				
-				// Clear previous results
-				this.clearProgressView();
-				this.clearResultsView();
-				
-				// Send the FULL project path to the backend
-				if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-					this.ws.send(JSON.stringify({
-						type: 'analyze_project',
-						path: projectPath // Send the full path string
-					}));
-					this.updateStatus(`Analyzing project: ${projectName}`);
-				} else {
-					this.updateStatus('Not connected to backend');
-				}
-			}
+                // Save/update the project and get the full object back, including its ID
+                this.currentProject = await this.saveProject(projectData);
+
+                // Reset state for the new analysis
+                this.currentResults = [];
+                this.currentProgressLog = [];
+                
+                this.clearProgressView();
+                this.clearResultsView();
+                this.switchToView('progress');
+                
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    this.ws.send(JSON.stringify({
+                        type: 'analyze_project',
+                        path: projectPath
+                    }));
+                    this.updateStatus(`Analyzing project: ${projectName}`);
+                } else {
+                    this.updateStatus('Not connected to backend');
+                    this.addProgressUpdate('Error: Not connected to backend.');
+                }
+            }
 
             async saveProject(project) {
                 return new Promise((resolve, reject) => {
                     const transaction = this.db.transaction(['projects'], 'readwrite');
                     const store = transaction.objectStore('projects');
-                    
-                    // Check if project already exists
                     const index = store.index('path');
                     const request = index.get(project.path);
                     
+                    request.onerror = () => reject(request.error);
+                    
                     request.onsuccess = () => {
                         if (request.result) {
-                            // Update existing project
-                            const updateRequest = store.put({
-                                ...request.result,
-                                lastOpened: project.lastOpened
-                            });
-                            updateRequest.onsuccess = () => {
-                                this.loadProjects();
-                                resolve();
-                            };
+                            // Project exists, update it
+                            const updatedProject = { ...request.result, lastOpened: project.lastOpened };
+                            const updateRequest = store.put(updatedProject);
+                            updateRequest.onsuccess = () => { this.loadProjects(); resolve(updatedProject); };
+                            updateRequest.onerror = () => reject(updateRequest.error);
                         } else {
-                            // Add new project
+                            // New project, add it
                             const addRequest = store.add(project);
-                            addRequest.onsuccess = () => {
-                                this.loadProjects();
-                                resolve();
+                            addRequest.onerror = () => reject(addRequest.error);
+                            addRequest.onsuccess = (event) => {
+                                // Get the full project object back with the new ID
+                                const getRequest = store.get(event.target.result);
+                                getRequest.onsuccess = () => { this.loadProjects(); resolve(getRequest.result); };
+                                getRequest.onerror = () => reject(getRequest.error);
                             };
                         }
                     };
-                    
-                    request.onerror = () => reject(request.error);
                 });
             }
 
             async loadProjects() {
-                return new Promise((resolve, reject) => {
-                    const transaction = this.db.transaction(['projects'], 'readonly');
-                    const store = transaction.objectStore('projects');
-                    const request = store.getAll();
-                    
-                    request.onsuccess = () => {
-                        const projects = request.result.sort((a, b) => 
-                            new Date(b.lastOpened) - new Date(a.lastOpened)
-                        );
-                        this.displayProjects(projects);
-                        resolve();
-                    };
-                    
-                    request.onerror = () => reject(request.error);
-                });
+                const transaction = this.db.transaction(['projects'], 'readonly');
+                const store = transaction.objectStore('projects');
+                const request = store.getAll();
+                
+                request.onsuccess = () => {
+                    const projects = request.result.sort((a, b) => new Date(b.lastOpened) - new Date(a.lastOpened));
+                    this.displayProjects(projects);
+                };
             }
 
             displayProjects(projects) {
@@ -480,25 +470,65 @@
                 projects.forEach(project => {
                     const li = document.createElement('li');
                     li.className = 'project-item';
-                    li.innerHTML = `
-                        <div class="project-name">${project.name}</div>
-                        <div class="project-path">${project.path}</div>
-                    `;
+                    li.innerHTML = `<div class="project-name">${project.name}</div><div class="project-path">${project.path}</div>`;
                     
                     li.addEventListener('click', () => {
-                        this.loadProjectResults(project);
+                        // Load the last analysis for this project from the DB
+                        this.loadAnalysisForProject(project);
                     });
                     
                     projectList.appendChild(li);
                 });
             }
 
-            async loadProjectResults(project) {
-                // Implementation for loading saved results would go here
-                this.updateStatus(`Loaded project: ${project.name}`);
+            async loadAnalysisForProject(project) {
+                const transaction = this.db.transaction(['analyses'], 'readonly');
+                const store = transaction.objectStore('analyses');
+                const index = store.index('projectId');
+                const request = index.getAll(project.id);
+                
+                request.onerror = (e) => console.error("Error loading analysis:", e);
+                
+                request.onsuccess = () => {
+                    const analyses = request.result;
+                    if (analyses && analyses.length > 0) {
+                        analyses.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+                        const latestAnalysis = analyses[0];
+                        this.displayStoredAnalysis(latestAnalysis);
+                        this.updateStatus(`Loaded analysis for ${project.name} from ${new Date(latestAnalysis.timestamp).toLocaleString()}`);
+                    } else {
+                        this.clearProgressView();
+                        this.clearResultsView();
+                        this.switchToView('progress');
+                        document.getElementById('progressView').innerHTML = '<div class="empty-state">No analysis history found for this project.</div>';
+                        this.updateStatus(`No analysis history for ${project.name}`);
+                    }
+                };
+            }
+
+            displayStoredAnalysis(analysis) {
+                this.clearProgressView();
+                this.clearResultsView();
+
+                // Display stored progress log
+                analysis.progressLog.forEach(log => this._renderProgressUpdate(log));
+                
+                // Display stored findings
+                if (analysis.findings && analysis.findings.length > 0) {
+                    analysis.findings.forEach(finding => this._renderFinding(finding));
+                    this.switchToView('results');
+                } else {
+                    document.getElementById('resultsView').innerHTML = '<div class="empty-state">No issues were found in this analysis run.</div>';
+                    this.switchToView('progress');
+                }
             }
 
             addProgressUpdate(progress) {
+                this.currentProgressLog.push(progress);
+                this._renderProgressUpdate(progress);
+            }
+
+            _renderProgressUpdate(progress) {
                 const progressView = document.getElementById('progressView');
                 const emptyState = progressView.querySelector('.empty-state');
                 if (emptyState) emptyState.remove();
@@ -512,37 +542,35 @@
             }
 
             addFinding(finding) {
+                this.currentResults.push(finding);
+                this._renderFinding(finding);
+            }
+
+            _renderFinding(finding) {
                 const resultsView = document.getElementById('resultsView');
                 const emptyState = resultsView.querySelector('.empty-state');
                 if (emptyState) emptyState.remove();
-                
-                this.currentResults.push(finding);
-                
+
                 const findingElement = document.createElement('div');
                 findingElement.className = 'finding';
                 
                 findingElement.innerHTML = `
                     <div class="finding-header">
                         <div class="finding-position">${finding.file}:${finding.line}:${finding.column}</div>
-                        <div class="finding-description">${finding.description}</div>
+                        <div class="finding-description">${this.escapeHtml(finding.description)}</div>
                     </div>
-                    <div class="code-viewer">
-                        ${this.renderCodeLines(finding.codeLines, finding.problemLineIndex)}
-                    </div>
+                    <div class="code-viewer">${this.renderCodeLines(finding.codeLines, finding.problemLineIndex)}</div>
                 `;
                 
                 resultsView.appendChild(findingElement);
-                resultsView.scrollTop = resultsView.scrollHeight;
             }
 
             renderCodeLines(lines, problemIndex) {
                 return lines.map((line, index) => {
-                    const lineNumber = line.number;
                     const isProblemLine = index === problemIndex;
-                    
                     return `
                         <div class="code-line ${isProblemLine ? 'problem-line' : ''}">
-                            <div class="line-number">${lineNumber}</div>
+                            <div class="line-number">${line.number}</div>
                             <div class="line-content">${this.escapeHtml(line.content)}</div>
                         </div>
                     `;
@@ -556,53 +584,58 @@
             }
 
             clearProgressView() {
-                const progressView = document.getElementById('progressView');
-                progressView.innerHTML = '<div class="empty-state">Analysis starting...</div>';
+                document.getElementById('progressView').innerHTML = '<div class="empty-state"></div>';
             }
 
             clearResultsView() {
-                const resultsView = document.getElementById('resultsView');
-                resultsView.innerHTML = '<div class="empty-state">Scanning for issues...</div>';
+                document.getElementById('resultsView').innerHTML = '<div class="empty-state"></div>';
             }
 
             handleAnalysisComplete() {
                 this.addProgressUpdate('Analysis complete!');
                 this.updateStatus(`Analysis complete. Found ${this.currentResults.length} issues.`);
-                
-                // Save results if we have a current project
                 if (this.currentProject) {
-                    this.saveResults();
+                    this.saveCurrentAnalysis();
                 }
             }
 
-            async saveResults() {
-                if (!this.currentProject || this.currentResults.length === 0) return;
+            async saveCurrentAnalysis() {
+                if (!this.currentProject || !this.currentProject.id) return;
                 
-                const resultsData = {
+                const analysisData = {
                     projectId: this.currentProject.id,
-                    projectName: this.currentProject.name,
-                    projectPath: this.currentProject.path,
-                    results: this.currentResults,
+                    findings: this.currentResults,
+                    progressLog: this.currentProgressLog,
                     timestamp: new Date().toISOString()
                 };
                 
-                return new Promise((resolve, reject) => {
-                    const transaction = this.db.transaction(['results'], 'readwrite');
-                    const store = transaction.objectStore('results');
-                    const request = store.add(resultsData);
-                    
-                    request.onsuccess = () => resolve();
-                    request.onerror = () => reject(request.error);
-                });
+                const transaction = this.db.transaction(['analyses'], 'readwrite');
+                const store = transaction.objectStore('analyses');
+                store.add(analysisData);
             }
 
             handleError(error) {
-                this.addProgressUpdate(`Error: ${error}`);
+                const errorMessage = `Error: ${error}`;
+                this.addProgressUpdate(errorMessage);
                 this.updateStatus('Analysis failed');
+                if (this.currentProject) {
+                    this.saveCurrentAnalysis(); // Save the failed run with the error message
+                }
             }
 
             updateStatus(message) {
                 document.getElementById('statusText').textContent = message;
+            }
+
+            switchToView(viewName) {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                document.querySelectorAll('.progress-view, .results-view').forEach(v => v.classList.remove('active'));
+                
+                const tab = document.querySelector(`.tab[data-view="${viewName}"]`);
+                const view = document.getElementById(viewName + 'View');
+                
+                if (tab) tab.classList.add('active');
+                if (view) view.classList.add('active');
             }
         }
 
